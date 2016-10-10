@@ -1,7 +1,7 @@
 import os
 import csv, re, numpy, json, ast, re
 import shutil, datetime, logging
-import ctk, vtk, qt
+import ctk, vtk, qt, slicer
 from collections import OrderedDict
 
 
@@ -18,7 +18,7 @@ class SlicerCaseManager(ScriptedLoadableModule):
     self.parent.title = "SlicerCaseManager"
     self.parent.categories = ["Radiology"]
     self.parent.dependencies = ["SlicerProstate"]
-    self.parent.contributors = ["Longquan Chen(SPL)","Christian Herz (SPL)"]
+    self.parent.contributors = ["Christian Herz (SPL)","Longquan Chen(SPL)"]
     self.parent.helpText = """A common module for case management in Slicer"""
     self.parent.acknowledgementText = """Surgical Planning Laboratory, Brigham and Women's Hospital, Harvard
                                         Medical School, Boston, USA This work was supported in part by the National
@@ -26,20 +26,6 @@ class SlicerCaseManager(ScriptedLoadableModule):
                                         R01 CA111288 and P41 EB015898. The code is originated from the module SliceTracker"""
 
 class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
-  @property
-  def currentCaseDirectory(self):
-    return self._currentCaseDirectory
-
-  @currentCaseDirectory.setter
-  def currentCaseDirectory(self, path):
-    self._currentCaseDirectory = path
-    valid = path is not None
-    if valid:
-      value = self.currentCaseDirectory
-      self.caseWatchBox.setInformation("CurrentCaseDirectory", os.path.relpath(value, self.caseRootDir), toolTip=value)
-    else:
-      self.caseWatchBox.reset()
-
   @property
   def caseRootDir(self):
     return self.casesRootDirectoryButton.directory
@@ -55,15 +41,90 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
     self.casesRootDirectoryButton.toolTip = path
     self.openCaseButton.enabled = exists
     self.createNewCaseButton.enabled = exists
+  
+  @property
+  def caseDirectoryList(self):
+    return self._caseDirectoryList
+
+  @caseDirectoryList.setter
+  def caseDirectoryList(self,list):
+    self._caseDirectoryList = list      
+  
+  @property
+  def preopDataDir(self):
+    return self._preopDataDir
+
+  @preopDataDir.setter
+  def preopDataDir(self, path):
+    self._preopDataDir = path
+    if path is None:
+      return
+    if os.path.exists(path):
+      self.loadPreopData()
+  
+  @property
+  def mpReviewPreprocessedOutput(self):
+    return os.path.join(self.currentCaseDirectory, "mpReviewPreprocessed") if self.currentCaseDirectory else None
 
   @property
   def preopDICOMDataDirectory(self):
     return os.path.join(self.currentCaseDirectory, "DICOM", "Preop") if self.currentCaseDirectory else None
 
+  @property
+  def intraopDICOMDataDirectory(self):
+    return os.path.join(self.currentCaseDirectory, "DICOM", "Intraop") if self.currentCaseDirectory else None
+
+  @property
+  def outputDir(self):
+    return os.path.join(self.currentCaseDirectory, "SliceTrackerOutputs")
+
+  @property
+  def currentCaseDirectory(self):
+    return self._currentCaseDirectory
+
+  @property
+  def currentTargets(self):
+    return self._currentTargets
+
+  @currentTargets.setter
+  def currentTargets(self, targets):
+    self._currentTargets = targets
+    self.targetTableModel.targetList = targets
+    if not targets:
+      self.targetTableModel.coverProstateTargetList = None
+    else:
+      coverProstate = self.registrationResults.getMostRecentApprovedCoverProstateRegistration()
+      if coverProstate:
+        self.targetTableModel.coverProstateTargetList = coverProstate.approvedTargets
+    self.targetTable.enabled = targets is not None
+
+  @currentCaseDirectory.setter
+  def currentCaseDirectory(self, path):
+    self._currentCaseDirectory = path
+    valid = path is not None
+    self.closeCaseButton.enabled = valid
+    if not valid:
+      self.caseWatchBox.reset()
+
+  @property
+  def generatedOutputDirectory(self):
+    return self._generatedOutputDirectory
+
+  @generatedOutputDirectory.setter
+  def generatedOutputDirectory(self, path):
+    if not os.path.exists(path):
+      self.logic.createDirectory(path)
+    exists = os.path.exists(path)
+    self._generatedOutputDirectory = path if exists else ""
+    self.completeCaseButton.enabled = exists and not self.logic.caseCompleted
+
   def __init__(self, parent=None):
     ScriptedLoadableModuleWidget.__init__(self, parent)
+    self.logic = SlicerCaseManagerLogic()
     self.modulePath = os.path.dirname(slicer.util.modulePath(self.moduleName))
     self._currentCaseDirectory = None
+    self._caseDirectoryList = {}
+    self.caseDirectoryList = {"DICOM/Preop"}
 
   def setup(self):
     ScriptedLoadableModuleWidget.setup(self)
@@ -73,9 +134,14 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
     self.mainGUIGroupBox.setLayout(self.mainGUIGroupBoxLayout)
     self.createNewCaseButton = self.createButton("New case")
     self.openCaseButton = self.createButton("Open case")
+    self.closeCaseButton = self.createButton("Close case", toolTip="Close case without completing it", enabled=False)
+    self.completeCaseButton = self.createButton('Case completed', enabled=False)
     self.mainGUIGroupBoxLayout.addWidget(self.createNewCaseButton, 1, 0)
-    self.mainGUIGroupBoxLayout.addWidget(self.openCaseButton, 1, 1)
+    self.mainGUIGroupBoxLayout.addWidget(self.closeCaseButton, 1, 1)
+    self.mainGUIGroupBoxLayout.addWidget(self.completeCaseButton, 1, 1)
+    
     self.createPatientWatchBox()
+    #self.createIntraopWatchBox()
     self.createCaseInformationArea()
     self.setupConnections()
     self.layout.addWidget(self.mainGUIGroupBox)
@@ -101,7 +167,16 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
                                        WatchBoxAttribute('StudyDate', 'Preop Study Date: ', DICOMTAGS.STUDY_DATE)]
     self.patientWatchBox = DICOMBasedInformationWatchBox(self.patientWatchBoxInformation)
     self.layout.addWidget(self.patientWatchBox)
-
+  
+  def createIntraopWatchBox(self):
+    intraopWatchBoxInformation = [WatchBoxAttribute('StudyDate', 'Intraop Study Date: ', DICOMTAGS.STUDY_DATE),
+                                  WatchBoxAttribute('CurrentSeries', 'Current Series: ', [DICOMTAGS.SERIES_NUMBER,
+                                                                                          DICOMTAGS.SERIES_DESCRIPTION])]
+    self.intraopWatchBox = DICOMBasedInformationWatchBox(intraopWatchBoxInformation)
+    self.registrationDetailsButton = self.createButton("", styleSheet="border:none;",
+                                                       maximumWidth=16)
+    self.layout.addWidget(self.intraopWatchBox)
+  
   def createCaseInformationArea(self):
     self.casesRootDirectoryButton = self.createDirectoryButton(text="Choose cases root location",
                                                                caption="Choose cases root location",
@@ -126,20 +201,34 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
     self.openCaseButton.clicked.connect(self.onOpenCaseButtonClicked)
     self.casesRootDirectoryButton.directoryChanged.connect(lambda: setattr(self, "caseRootDir",
                                                                            self.casesRootDirectoryButton.directory))
+    self.completeCaseButton.clicked.connect(self.onCompleteCaseButtonClicked)
+    self.closeCaseButton.clicked.connect(self.clearData)
 
   def onCreateNewCaseButtonClicked(self):
     if not self.checkAndWarnUserIfCaseInProgress():
       return
+    self.clearData()
     self.caseDialog = NewCaseSelectionNameWidget(self.caseRootDir)
     selectedButton = self.caseDialog.exec_()
     if selectedButton == qt.QMessageBox.Ok:
       newCaseDirectory = self.caseDialog.newCaseDirectory
       os.mkdir(newCaseDirectory)
-      os.mkdir(os.path.join(newCaseDirectory, "DICOM"))
-      os.mkdir(os.path.join(newCaseDirectory, "DICOM", "Preop"))
-      os.mkdir(os.path.join(newCaseDirectory, "VentriculostomyOutputs"))
+      for direcory in self.caseDirectoryList:
+        subDirectory = direcory.split("/")
+        for iIndex in range(len(subDirectory)+1):
+          fullPath = ""
+          for jIndex in range(iIndex):
+            fullPath = os.path.join(fullPath,subDirectory[jIndex])
+          if not os.path.exists(os.path.join(newCaseDirectory,fullPath)): 
+            os.mkdir(os.path.join(newCaseDirectory,fullPath))      
+      self.currentCaseDirectory = newCaseDirectory      
       self.startPreopDICOMReceiver()
-
+  
+  def onCompleteCaseButtonClicked(self):
+    self.logic.caseCompleted = True
+    self.save(showDialog=True)
+    self.clearData()
+  
   def onOpenCaseButtonClicked(self):
     if not self.checkAndWarnUserIfCaseInProgress():
       return
@@ -149,6 +238,7 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
     self.currentCaseDirectory = path
     if not os.path.exists(os.path.join(path, "DICOM", "Preop")):
       slicer.util.warningDisplay("The selected case directory seems not to be valid", windowTitle="")
+      self.clearData()
     else:
       slicer.util.loadVolume(self.preopImagePath, returnNode=True)
       self.loadCaseData()
@@ -163,23 +253,274 @@ class SlicerCaseManagerWidget(ModuleWidgetMixin, ScriptedLoadableModuleWidget):
   def startPreopDICOMReceiver(self):
     self.preopTransferWindow = IncomingDataWindow(incomingDataDirectory=self.preopDICOMDataDirectory,
                                                   skipText="No Preop available")
+    self.preopTransferWindow.addObserver(SlicerProstateEvents.IncomingDataSkippedEvent,
+                                         self.continueWithoutPreopData)
     self.preopTransferWindow.addObserver(SlicerProstateEvents.IncomingDataCanceledEvent,
                                          self.onPreopTransferMessageBoxCanceled)
     self.preopTransferWindow.addObserver(SlicerProstateEvents.IncomingDataReceiveFinishedEvent,
                                          self.startPreProcessingPreopData)
     self.preopTransferWindow.show()
-
+  
+  def continueWithoutPreopData(self, caller, event):
+    self.cleanupPreopDICOMReceiver()
+    self.simulatePreopPhaseButton.enabled = False
+    self.simulateIntraopPhaseButton.enabled = True
+  
+  def cleanupPreopDICOMReceiver(self):
+    if self.preopTransferWindow:
+      self.preopTransferWindow.hide()
+      self.preopTransferWindow.removeObservers()
+      self.preopTransferWindow = None
+  
   def onPreopTransferMessageBoxCanceled(self,caller, event):
+    self.clearData()
     pass
 
-  def startPreProcessingPreopData(self, caller, event):
+  def startPreProcessingPreopData(self, caller=None, event=None):
+    self.cleanupPreopDICOMReceiver()
     pass
 
 
   def loadCaseData(self):
 
     pass
+  
+  def clearData(self):
+    pass
 
+class SlicerCaseManagerLogic(ScriptedLoadableModuleLogic):
+  
+  @property
+  def caseCompleted(self):
+    return self._caseCompleted
+
+  @caseCompleted.setter
+  def caseCompleted(self, value):
+    self._caseCompleted = value
+    if value is True:
+      self.stopSmartDICOMReceiver()
+  
+  def __init__(self):
+    ScriptedLoadableModuleLogic.__init__(self)
+    self.caseCompleted = True
+    self.DEFAULT_JSON_FILE_NAME = "results.json"
+  
+  def stopSmartDICOMReceiver(self):
+    self.smartDicomReceiver = getattr(self, "smartDicomReceiver", None)
+    if self.smartDicomReceiver:
+      self.smartDicomReceiver.stop()
+      self.smartDicomReceiver.removeObservers()
+  
+  def closeCase(self, directory):
+    self.stopSmartDICOMReceiver()
+    if os.path.exists(directory):
+      self.caseCompleted = False
+      if self.getDirectorySize(directory) == 0:
+        shutil.rmtree(directory)
+        
+  def hasCaseBeenCompleted(self, directory):
+    self.caseCompleted = False
+    filename = os.path.join(directory, self.DEFAULT_JSON_FILE_NAME)
+    if not os.path.exists(filename):
+      return
+    with open(filename) as data_file:
+      data = json.load(data_file)
+      self.caseCompleted = data["completed"]
+    return self.caseCompleted    
+
+class SliceTrackerCaseManager(ScriptedLoadableModule):
+  def __init__(self, parent):
+    ScriptedLoadableModule.__init__(self, parent)
+    self.parent.title = "SliceTrackerCaseManager"
+    self.parent.categories = ["Radiology"]
+    self.parent.dependencies = ["SlicerProstate"]
+    self.parent.contributors = ["Christian Herz (SPL)","Longquan Chen(SPL)"]
+    self.parent.helpText = """A common module for case management in Slicer"""
+    self.parent.acknowledgementText = """Surgical Planning Laboratory, Brigham and Women's Hospital, Harvard
+                                        Medical School, Boston, USA This work was supported in part by the National
+                                        Institutes of Health through grants R01 EB020667, U24 CA180918,
+                                        R01 CA111288 and P41 EB015898. The code is originated from the module SliceTracker"""
+
+
+class SliceTrackerCaseManagerWidget(SlicerCaseManagerWidget):
+  def __init__(self, parent=None):
+    ScriptedLoadableModuleWidget.__init__(self, parent)
+    self.logic = SliceTrackerCaseManagerLogic()
+    
+  def setup(self):
+    SlicerCaseManagerWidget.setup(self)  
+    self.caseDirectoryList = {""}
+  
+  def onCreateNewCaseButtonClicked(self):
+    Super(SliceTrackerCaseManagerWidget,self).onCreateNewCaseButtonClicked()
+    self.simulatePreopPhaseButton.enabled = True
+    self.simulateIntraopPhaseButton.enabled = True
+    
+  def setupTrainingSectionUIElements(self):
+    self.collapsibleTrainingArea = ctk.ctkCollapsibleButton()
+    self.collapsibleTrainingArea.collapsed = True
+    self.collapsibleTrainingArea.text = "Training"
+
+    self.simulatePreopPhaseButton = self.createButton("Simulate preop phase", enabled=False)
+    self.simulateIntraopPhaseButton = self.createButton("Simulate intraop phase", enabled=False)
+
+    self.trainingsAreaLayout = qt.QGridLayout(self.collapsibleTrainingArea)
+    self.trainingsAreaLayout.addWidget(self.createHLayout([self.simulatePreopPhaseButton,
+                                                           self.simulateIntraopPhaseButton]))  
+  
+  def loadCaseData(self):
+    Super(SliceTrackerCaseManagerWidget, self).loadCaseData()
+    from mpReview import mpReviewLogic
+    savedSessions = self.logic.getSavedSessions(self.currentCaseDirectory)
+    if len(savedSessions) > 0: # After registration(s) has been done
+      if not self.openSavedSession(savedSessions):
+        self.clearData()
+    else:
+      if os.path.exists(self.mpReviewPreprocessedOutput) and \
+              mpReviewLogic.wasmpReviewPreprocessed(self.mpReviewPreprocessedOutput):
+        self.preopDataDir = self.logic.getFirstMpReviewPreprocessedStudy(self.mpReviewPreprocessedOutput)
+        self.intraopDataDir = self.intraopDICOMDataDirectory
+      else:
+        if len(os.listdir(self.preopDICOMDataDirectory)):
+          self.startPreProcessingPreopData()
+        elif len(os.listdir(self.intraopDICOMDataDirectory)):
+          self.logic.usePreopData = False
+          self.intraopDataDir = self.intraopDICOMDataDirectory
+        else:
+          self.startPreopDICOMReceiver()
+    self.configureAllTargetDisplayNodes()
+    
+  def openSavedSession(self, sessions):
+    # TODO: session selector and if not continuing, ask for creating a new one.
+    latestCase = os.path.join(max(sessions, key=os.path.getmtime), "MRgBiopsy")
+    self.logic.caseCompleted = self.logic.hasCaseBeenCompleted(latestCase)
+    message = "A %s session has been found for the selected case. Do you want to %s?" \
+              % ("completed" if self.logic.caseCompleted else "started",
+                 "open it" if self.logic.caseCompleted else "continue this session")
+    if slicer.util.confirmYesNoDisplay(message):
+      self.continueOldCase = True
+      self.logic.loadFromJSON(latestCase)
+      if self.logic.usePreopData:
+        self.preopDataDir = self.logic.getFirstMpReviewPreprocessedStudy(self.mpReviewPreprocessedOutput)
+      else:
+        if self.logic.preopTargets:
+          self.setupPreopLoadedTargets()
+      self.generatedOutputDirectory = latestCase
+      self.intraopDataDir = os.path.join(self.currentCaseDirectory, "DICOM", "Intraop")
+      return True
+    else:
+      return False
+    
+  def clearData(self):
+    Super(SliceTrackerCaseManagerWidget, self).clearData()
+    self.simulatePreopPhaseButton.enabled = False
+    self.simulateIntraopPhaseButton.enabled = False
+    self.cleanupPreopDICOMReceiver()
+    self.sampleDownloader.resetAndInitialize()
+    if self.caseManagerWidget.currentCaseDirectory:
+      self.logic.closeCase(self.caseManagerWidget.currentCaseDirectory)
+      self.caseManagerWidget.currentCaseDirectory = None
+    slicer.mrmlScene.Clear(0)
+    self.logic.resetAndInitializeData()
+    self.updateIntraopSeriesSelectorTable()
+    self.updateIntraopSeriesSelectorColor(None)
+    self.removeSliceAnnotations()
+    self.seriesModel.clear()
+    self.trackTargetsButton.setEnabled(False)
+    self.currentTargets = None
+    self.resetViewSettingButtons()
+    self.resetVisualEffects()
+    self.disconnectKeyEventObservers()
+    self.patientWatchBox.sourceFile = None
+    self.intraopWatchBox.sourceFile = None
+    self.continueOldCase = False
+    if self.customStatusProgressBar:
+      self.customStatusProgressBar.reset()
+      self.customStatusProgressBar.hide()   
+      
+  def continueWithoutPreopData(self, caller, event):
+    Super(SliceTrackerCaseManagerWidget, self).continueWithoutPreopData(caller, event)
+    self.logic.usePreopData = False
+    self.simulatePreopPhaseButton.enabled = False
+    self.simulateIntraopPhaseButton.enabled = True    
+
+class SliceTrackerCaseManagerLogic(SlicerCaseManagerLogic):
+  def __init__(self):
+    ScriptedLoadableModuleLogic.__init__(self)
+    self.seriesList = []
+    self.loadableList = {}
+    
+  @property
+  def intraopDataDir(self):
+    return self._intraopDataDir
+
+  @intraopDataDir.setter
+  def intraopDataDir(self, path):
+    self._intraopDataDir = path
+    if not self.caseCompleted:
+      self.startSmartDICOMReceiver(runStoreSCP=not self.trainingMode)
+    else:
+      self.invokeEvent(SlicerProstateEvents.DICOMReceiverStoppedEvent)
+    self.importDICOMSeries(self.getFileList(self.intraopDataDir))
+    if self.smartDicomReceiver:
+      self.smartDicomReceiver.forceStatusChangeEvent()
+      
+  def startSmartDICOMReceiver(self, runStoreSCP=True):
+    self.stopSmartDICOMReceiver()
+    self.smartDicomReceiver = SmartDICOMReceiver(self.intraopDataDir)
+    self.smartDicomReceiver.addObserver(SlicerProstateEvents.IncomingDataReceiveFinishedEvent,
+                                        self.onDICOMSeriesReceived)
+    self.smartDicomReceiver.addObserver(SlicerProstateEvents.StatusChangedEvent,
+                                        self.onDICOMReceiverStatusChanged)
+    self.smartDicomReceiver.addObserver(SlicerProstateEvents.DICOMReceiverStoppedEvent,
+                                        self.onSmartDICOMReceiverStopped)
+    self.smartDicomReceiver.start(runStoreSCP)
+
+  def onSmartDICOMReceiverStopped(self, caller, event, callData=None):
+    self.invokeEvent(SlicerProstateEvents.DICOMReceiverStoppedEvent)
+
+  @vtk.calldata_type(vtk.VTK_STRING)
+  def onDICOMReceiverStatusChanged(self, caller, event, callData):
+    self.invokeEvent(SlicerProstateEvents.StatusChangedEvent, callData)
+
+  @vtk.calldata_type(vtk.VTK_STRING)
+  def onDICOMSeriesReceived(self, caller, event, callData):
+    newFileList = ast.literal_eval(callData)
+    self.importDICOMSeries(newFileList)
+    if self.trainingMode is True:
+      self.stopSmartDICOMReceiver()
+
+  def importDICOMSeries(self, newFileList):
+    indexer = ctk.ctkDICOMIndexer()
+
+    eligibleSeriesFiles = []
+    size = len(newFileList)
+    for currentIndex, currentFile in enumerate(newFileList, start=1):
+      self.invokeEvent(SlicerProstateEvents.NewFileIndexedEvent, ["Indexing file %s" % currentFile, size, currentIndex].__str__())
+      slicer.app.processEvents()
+      currentFile = os.path.join(self._intraopDataDir, currentFile)
+      indexer.addFile(slicer.dicomDatabase, currentFile, None)
+      series = self.makeSeriesNumberDescription(currentFile)
+      if series:
+        eligibleSeriesFiles.append(currentFile)
+        if series not in self.seriesList:
+          self.seriesList.append(series)
+          self.createLoadableFileListForSeries(series)
+
+    self.seriesList = sorted(self.seriesList, key=lambda s: RegistrationResult.getSeriesNumberFromString(s))
+
+    if len(eligibleSeriesFiles):
+      self.invokeEvent(SlicerProstateEvents.NewImageDataReceivedEvent, eligibleSeriesFiles.__str__())
+
+  def createLoadableFileListForSeries(self, selectedSeries):
+    selectedSeriesNumber = int(selectedSeries.split(": ")[0])
+    self.loadableList[selectedSeries] = []
+    for dcm in self.getFileList(self._intraopDataDir):
+      currentFile = os.path.join(self._intraopDataDir, dcm)
+      currentSeriesNumber = int(self.getDICOMValue(currentFile, DICOMTAGS.SERIES_NUMBER))
+      if currentSeriesNumber and currentSeriesNumber == selectedSeriesNumber:
+        self.loadableList[selectedSeries].append(currentFile)    
+    
 class NewCaseSelectionNameWidget(qt.QMessageBox, ModuleWidgetMixin):
 
   PREFIX = "Case"
